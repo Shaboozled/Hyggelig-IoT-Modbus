@@ -1,212 +1,192 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <time.h>
+#include <math.h>
 
-#include <PubSubClient.h>
+#include "ModbusServerWiFi.h"
 
-// Set to 1 below to use TLS for a public/internet MQTT broker.
-#define MQTT_USE_TLS 1
+// ============================================================================
+// ESP32 #1 - SENSOR UNIT / MODBUS TCP SERVER
+//
+// This firmware connects to the Wi-Fi access point created by ESP32 #2
+// (the gateway) and exposes three holding registers over Modbus TCP.
+//
+// It is configured to match the gateway firmware supplied earlier:
+//   Gateway AP SSID:       ESP32_LOCAL
+//   Gateway AP password:   ChangeThisAPPassword
+//   Sensor ESP32 IP:       192.168.50.2
+//   Gateway AP IP:         192.168.50.1
+//   Modbus TCP port:       502
+//   Modbus unit ID:        1
+//   Function code:         0x03 (Read Holding Registers)
+//   Start address:         0 (zero-based; commonly documented as 40001)
+//   Register count:        3
+//
+// IMPORTANT: readSensorValues() currently returns DEMO values. Replace that
+// function with reads from your actual sensors when you decide which sensors
+// and libraries to use.
+// ============================================================================
 
-// eModbus: asynchronous Modbus TCP client
-#include "ModbusClientTCP.h"
-#include "ModbusMessage.h"
+// ----------------------------- Wi-Fi settings -------------------------------
+static const char *WIFI_SSID = "ESP32_LOCAL";
+static const char *WIFI_PASSWORD = "ChangeThisAPPassword";
 
-#if MQTT_USE_TLS
-#include <WiFiClientSecure.h>
-#else
-#include <WiFiClient.h>
-#endif
+static const IPAddress DEVICE_IP(192, 168, 50, 2);
+static const IPAddress GATEWAY_IP(192, 168, 50, 1);
+static const IPAddress SUBNET_MASK(255, 255, 255, 0);
 
-// -----------------------------------------------------------------------------
-// USER CONFIGURATION - EDIT THESE VALUES
-// -----------------------------------------------------------------------------
-
-// Local Wi-Fi network created by THIS gateway ESP32.
-static const char *AP_SSID = "ESP32_LOCAL";
-static const char *AP_PASSWORD = "ChangeThisAPPassword"; // At least 8 characters
-static const uint8_t AP_CHANNEL = 6; // AP+STA ultimately follows the upstream AP channel
-
-// Wi-Fi network that provides internet access to this gateway.
-static const char *UPLINK_SSID = "MotorolaEdge20";
-static const char *UPLINK_PASSWORD = "projektlille";
-
-// Static IP of the OTHER ESP32 (the Modbus TCP server) on this gateway's AP network.
-// Configure the other ESP32 to use this address, subnet and gateway.
-static const IPAddress MODBUS_SERVER_IP(192, 168, 50, 2);
-static constexpr uint16_t MODBUS_PORT = 502;
-static constexpr uint8_t MODBUS_UNIT_ID = 1;
-
-// Modbus function 0x03 = Read Holding Registers.
-// Protocol addresses are zero-based: address 0 is often labelled 40001 in manuals.
-static constexpr uint16_t MODBUS_START_ADDRESS = 0;
-static constexpr uint16_t MODBUS_REGISTER_COUNT = 3;
-static constexpr uint32_t MODBUS_POLL_INTERVAL_MS = 2000;
-
-// Register map expected from the other ESP32:
-//   register 0: signed temperature in tenths of a degree C (e.g. 235 = 23.5 C)
-//   register 1: unsigned humidity in tenths of a percent (e.g. 552 = 55.2 %)
-//   register 2: unsigned pressure in tenths of hPa (e.g. 10132 = 1013.2 hPa)
-
-// Mosquitto broker reachable through the UPLINK Wi-Fi network.
-// Example for a broker on your LAN: host = PC/server LAN IP, port = 1883.
-// Example for an internet-hosted broker: use its DNS name and normally TLS port 8883.
-static const char *MQTT_HOST = "gruppe7.vps.webdock.cloud";
-static constexpr uint16_t MQTT_PORT = 8883;
-static const char *MQTT_TOPIC = "factory/machine01/sensors";
-static const char *MQTT_CLIENT_ID = "ESP32_1"; // Must be unique for this broker
-static const char *MQTT_USERNAME = ""; // Leave empty if broker has no username
-static const char *MQTT_PASSWORD = ""; // Leave empty if broker has no password
-
-// 0 = plain MQTT (suitable for an isolated local-network test only).
-// 1 = MQTT over TLS (recommended for a broker reached over the public internet).
-
-#if MQTT_USE_TLS
-// Paste the PEM CA certificate that validates your broker's TLS certificate.
-// Do not use setInsecure() for a production/public-internet connection.
-static const char *MQTT_CA_CERT = R"PEM(
------BEGIN CERTIFICATE-----
-MIIDsTCCApmgAwIBAgIUFTKyiPD4pCMh1oDFaHMCaxrYFAkwDQYJKoZIhvcNAQEL
-BQAwaDELMAkGA1UEBhMCREsxGjAYBgNVBAgMEVJlZ2lvbi1TeWRkYW5tYXJrMQ8w
-DQYDVQQHDAZPZGVuc2UxDDAKBgNVBAoMA1VDTDEMMAoGA1UECwwDVUNMMRAwDgYD
-VQQDDAdHcnVwcGU3MB4XDTI2MDkwMjExMDgxOFoXDTM2MDgzMDExMDgxOFowaDEL
-MAkGA1UEBhMCREsxGjAYBgNVBAgMEVJlZ2lvbi1TeWRkYW5tYXJrMQ8wDQYDVQQH
-DAZPZGVuc2UxDDAKBgNVBAoMA1VDTDEMMAoGA1UECwwDVUNMMRAwDgYDVQQDDAdH
-cnVwcGU3MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmaxhkJef8aiC
-U5KjrmgDDZ/SxLYYM+PVbMoeBonGQmJMPki/tVArn0hqCDxrOGpEzlS9aDiizZHT
-p2OPAWc5+Yqb1Kok2Esbp7yUUdrCfN7iDtHaGppt1BCVUOX+cksb/tQFLizhrfv4
-4Ukxk2j0+sTxO0unNIbv8KqEDrl+YB+j2femFalOUU/W8EjTQHH9oizLo8kc9f28
-XlM3I0EUUdJZ5NYLWksZLD7qHkVNDT7qcLxTgQWMjyB30GjKTFX5WSbLZMT5tCZ6
-NUbTnEHuAnKAgvt0Dr/LkUaYMS1ZkBKIHRQKXfey/m87U74lqxrcwYJexpFxfRtL
-1Kbkk9TpkwIDAQABo1MwUTAdBgNVHQ4EFgQUNEyiP6NLY4KNADHoqokR7SW8gnAw
-HwYDVR0jBBgwFoAUNEyiP6NLY4KNADHoqokR7SW8gnAwDwYDVR0TAQH/BAUwAwEB
-/zANBgkqhkiG9w0BAQsFAAOCAQEARm2Px/PcdW/2W52gmLUvKxmDKOq97uataX3U
-BZVKsupiJJc9/tgBfQcj5WhJCPBQO6+ZLBk0oOSTDbnik4yocDrv6vwC/NNYuq18
-ulp/16AH40vS5aVSBLHKEC58m1126c+SxCB34Inffl5DZvXTjLs1zmCy2rbFmnjz
-7RzKLFJp0qvchGi8ddqGwqnawxJC7nSwPn+3o21ogBwBhWD45FWxmHPEw8BnPtLi
-or/CVw6ngisBhyT1C+zRPjP6d/35kjxwBvV735WHeY5JAxO5VhPWMYHBEfxFlzD9
-svNEmD46vDagMOs3qek5pjRsCIidzw81o7kSTg/g3Ii/YWHfMg==
------END CERTIFICATE-----
-)PEM";
-#endif
-
-static constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 static constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 
-// -----------------------------------------------------------------------------
-// NETWORK AND CLIENT OBJECTS
-// -----------------------------------------------------------------------------
+// ---------------------------- Modbus settings -------------------------------
+static constexpr uint16_t MODBUS_TCP_PORT = 502;
+static constexpr uint8_t MODBUS_UNIT_ID = 1;
+static constexpr uint8_t FC_READ_HOLDING_REGISTERS = 0x03;
+static constexpr uint8_t MODBUS_MAX_CLIENTS = 2;
+static constexpr uint32_t MODBUS_CLIENT_TIMEOUT_MS = 15000;
 
-static const IPAddress AP_IP(192, 168, 50, 1);
-static const IPAddress AP_SUBNET(255, 255, 255, 0);
+// These addresses are zero-based Modbus PDU offsets.
+// Address 0 is commonly shown as holding register 40001 in device manuals.
+static constexpr uint16_t REG_TEMPERATURE = 0;
+static constexpr uint16_t REG_HUMIDITY = 1;
+static constexpr uint16_t REG_PRESSURE = 2;
+static constexpr uint16_t REGISTER_COUNT = 3;
 
-WiFiClient modbusTcpSocket;
-ModbusClientTCP modbusClient(modbusTcpSocket, MODBUS_SERVER_IP, MODBUS_PORT);
+// ----------------------------- Sensor settings -----------------------------
+static constexpr uint32_t SENSOR_UPDATE_INTERVAL_MS = 1000;
 
-#if MQTT_USE_TLS
-WiFiClientSecure mqttTransport;
-#else
-WiFiClient mqttTransport;
-#endif
-PubSubClient mqttClient(mqttTransport);
-
-// -----------------------------------------------------------------------------
-// SHARED DATA (Modbus callback runs on the library's worker task)
-// -----------------------------------------------------------------------------
-
-struct SensorData {
-  int16_t temperatureTenths;
-  uint16_t humidityTenths;
-  uint16_t pressureTenths;
-  uint32_t sequence;
+struct SensorValues {
+  float temperatureC;
+  float humidityPercent;
+  float pressureHpa;
 };
 
-static portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
-static SensorData latestData = {};
-static bool dataReady = false;
-static bool modbusRequestPending = false;
-static uint32_t nextRequestToken = 1;
+// Shared holding-register values.
+// Register 0: signed temperature, tenths of degrees C (e.g. 235 = 23.5 C)
+// Register 1: unsigned humidity, tenths of percent (e.g. 552 = 55.2 %)
+// Register 2: unsigned pressure, tenths of hPa (e.g. 10132 = 1013.2 hPa)
+static uint16_t holdingRegisters[REGISTER_COUNT] = {0, 0, 0};
+static portMUX_TYPE registerMux = portMUX_INITIALIZER_UNLOCKED;
 
-static uint32_t lastModbusPollMs = 0;
-static uint32_t lastMqttAttemptMs = 0;
+static ModbusServerWiFi modbusServer;
+static bool modbusServerStarted = false;
+static uint32_t lastSensorUpdateMs = 0;
 static uint32_t lastWifiRetryMs = 0;
 
-// -----------------------------------------------------------------------------
-// MODBUS RESPONSE CALLBACK
-// -----------------------------------------------------------------------------
+// ---------------------------- Sensor placeholder ---------------------------
+SensorValues readSensorValues() {
+  // DEMO VALUES ONLY.
+  // Replace these three values with measurements from your real sensors.
+  // For example:
+  //   values.temperatureC = yourTemperatureSensor.readCelsius();
+  //   values.humidityPercent = yourHumiditySensor.readHumidity();
+  //   values.pressureHpa = yourPressureSensor.readPressure() / 100.0f;
+  return {23.5f, 55.2f, 1013.2f};
+}
 
-void onModbusResponse(ModbusMessage message, uint32_t token) {
-  (void)token;
-
-  const Error modbusError = message.getError();
-
-  if (modbusError != SUCCESS) {
-    Serial.printf("Modbus response error: %u\n", static_cast<unsigned>(modbusError));
-    portENTER_CRITICAL(&dataMux);
-    modbusRequestPending = false;
-    portEXIT_CRITICAL(&dataMux);
-    return;
+// Convert a signed floating-point measurement to signed tenths.
+int16_t encodeSignedTenths(float value) {
+  if (!isfinite(value)) {
+    return 0;
   }
 
-  // FC03 response layout: [unit id][function][byte count][register data...]
-  // Three 16-bit registers require 3 + (3 * 2) = 9 bytes in this message.
-  if (message.getFunctionCode() != 0x03 || message.size() < 9) {
-    Serial.println("Modbus response had an unexpected function or length.");
-    portENTER_CRITICAL(&dataMux);
-    modbusRequestPending = false;
-    portEXIT_CRITICAL(&dataMux);
-    return;
+  long scaled = lroundf(value * 10.0f);
+  if (scaled < -32768L) scaled = -32768L;
+  if (scaled > 32767L) scaled = 32767L;
+  return static_cast<int16_t>(scaled);
+}
+
+// Convert a non-negative floating-point measurement to unsigned tenths.
+uint16_t encodeUnsignedTenths(float value) {
+  if (!isfinite(value) || value <= 0.0f) {
+    return 0;
   }
 
-  int16_t temperatureRaw = 0;
-  uint16_t humidityRaw = 0;
-  uint16_t pressureRaw = 0;
+  unsigned long scaled = static_cast<unsigned long>(lroundf(value * 10.0f));
+  if (scaled > 65535UL) scaled = 65535UL;
+  return static_cast<uint16_t>(scaled);
+}
 
-  // Data begins at byte offset 3 in the Modbus response message.
-  message.get(3, temperatureRaw);
-  message.get(5, humidityRaw);
-  message.get(7, pressureRaw);
+void updateHoldingRegisters() {
+  const SensorValues values = readSensorValues();
 
-  portENTER_CRITICAL(&dataMux);
-  latestData.temperatureTenths = temperatureRaw;
-  latestData.humidityTenths = humidityRaw;
-  latestData.pressureTenths = pressureRaw;
-  latestData.sequence++;
-  dataReady = true;
-  modbusRequestPending = false;
-  portEXIT_CRITICAL(&dataMux);
+  // Store signed temperature as its 16-bit two's-complement representation.
+  const int16_t temperatureRaw = encodeSignedTenths(values.temperatureC);
+  const uint16_t humidityRaw = encodeUnsignedTenths(values.humidityPercent);
+  const uint16_t pressureRaw = encodeUnsignedTenths(values.pressureHpa);
 
-  Serial.printf("Modbus OK: T=%.1f C, RH=%.1f %%, P=%.1f hPa\n",
+  // The Modbus server callback runs in a separate task, so protect shared data.
+  portENTER_CRITICAL(&registerMux);
+  holdingRegisters[REG_TEMPERATURE] = static_cast<uint16_t>(temperatureRaw);
+  holdingRegisters[REG_HUMIDITY] = humidityRaw;
+  holdingRegisters[REG_PRESSURE] = pressureRaw;
+  portEXIT_CRITICAL(&registerMux);
+
+  Serial.printf("Sensor values updated: T=%.1f C, RH=%.1f %%, P=%.1f hPa\n",
                 temperatureRaw / 10.0f,
                 humidityRaw / 10.0f,
                 pressureRaw / 10.0f);
 }
 
-// -----------------------------------------------------------------------------
-// WIFI
-// -----------------------------------------------------------------------------
+// -------------------------- Modbus request handler -------------------------
+// eModbus passes the Modbus PDU in this layout:
+//   byte 0: unit/server ID
+//   byte 1: function code
+//   byte 2-3: starting register address (big-endian, zero-based)
+//   byte 4-5: quantity of registers (big-endian)
+ModbusMessage handleReadHoldingRegisters(ModbusMessage request) {
+  uint16_t startAddress = 0;
+  uint16_t quantity = 0;
+  ModbusMessage response;
 
-void startWifi() {
-  WiFi.mode(WIFI_AP_STA);
+  if (request.size() < 6) {
+    response.setError(request.getServerID(), request.getFunctionCode(), ILLEGAL_DATA_VALUE);
+    return response;
+  }
+
+  request.get(2, startAddress);
+  request.get(4, quantity);
+
+  // Modbus FC03 permits 1..125 registers per request. This device exposes 3.
+  if (quantity == 0 || quantity > 125 ||
+      startAddress >= REGISTER_COUNT ||
+      quantity > (REGISTER_COUNT - startAddress)) {
+    response.setError(request.getServerID(), request.getFunctionCode(), ILLEGAL_DATA_ADDRESS);
+    return response;
+  }
+
+  uint16_t registerSnapshot[REGISTER_COUNT];
+  portENTER_CRITICAL(&registerMux);
+  for (uint16_t i = 0; i < REGISTER_COUNT; ++i) {
+    registerSnapshot[i] = holdingRegisters[i];
+  }
+  portEXIT_CRITICAL(&registerMux);
+
+  // Build FC03 response: [unit ID][function][byte count][register words...]
+  response.add(request.getServerID(),
+               request.getFunctionCode(),
+               static_cast<uint8_t>(quantity * 2));
+
+  for (uint16_t i = 0; i < quantity; ++i) {
+    response.add(registerSnapshot[startAddress + i]);
+  }
+
+  return response;
+}
+
+// ------------------------------- Wi-Fi --------------------------------------
+void startWiFi() {
+  WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
 
-  if (!WiFi.softAPConfig(AP_IP, AP_IP, AP_SUBNET)) {
-    Serial.println("Could not configure the local AP IP settings.");
+  if (!WiFi.config(DEVICE_IP, GATEWAY_IP, SUBNET_MASK)) {
+    Serial.println("WARNING: Could not apply the static IP configuration.");
   }
 
-  if (!WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, 1)) {
-    Serial.println("Failed to start the local Wi-Fi access point.");
-  } else {
-    Serial.printf("Local AP started: SSID=%s, IP=%s\n",
-                  AP_SSID, WiFi.softAPIP().toString().c_str());
-  }
-
-  // This station connection is ONLY for the gateway's own MQTT/internet traffic.
-  WiFi.begin(UPLINK_SSID, UPLINK_PASSWORD);
-  Serial.printf("Connecting to upstream Wi-Fi: %s\n", UPLINK_SSID);
+  Serial.printf("Connecting to gateway AP '%s'...\n", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-void maintainWifi() {
+void maintainWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     return;
   }
@@ -214,192 +194,67 @@ void maintainWifi() {
   const uint32_t now = millis();
   if (now - lastWifiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
     lastWifiRetryMs = now;
-    Serial.println("Upstream Wi-Fi disconnected; requesting reconnect...");
+    Serial.println("Wi-Fi disconnected; attempting to reconnect...");
     WiFi.reconnect();
   }
 }
 
-// -----------------------------------------------------------------------------
-// MQTT
-// -----------------------------------------------------------------------------
-
-void maintainMqtt() {
-  if (WiFi.status() != WL_CONNECTED || mqttClient.connected()) {
+void startModbusServerWhenConnected() {
+  if (modbusServerStarted || WiFi.status() != WL_CONNECTED) {
     return;
   }
 
-  const uint32_t now = millis();
-  if (now - lastMqttAttemptMs < MQTT_RECONNECT_INTERVAL_MS) {
-    return;
-  }
-  lastMqttAttemptMs = now;
+  Serial.printf("Connected. Sensor ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Gateway IP: %s\n", WiFi.gatewayIP().toString().c_str());
 
-  Serial.printf("Connecting to MQTT broker %s:%u...\n", MQTT_HOST, MQTT_PORT);
+  // Register the FC03 worker for unit ID 1, matching the gateway's request.
+  modbusServer.registerWorker(MODBUS_UNIT_ID,
+                             FC_READ_HOLDING_REGISTERS,
+                             &handleReadHoldingRegisters);
 
-  bool connected = false;
-  if (strlen(MQTT_USERNAME) > 0) {
-    connected = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
+  Serial.printf("Starting Modbus TCP server on port %u...\n", MODBUS_TCP_PORT);
+  modbusServerStarted = modbusServer.start(
+      MODBUS_TCP_PORT,
+      MODBUS_MAX_CLIENTS,
+      MODBUS_CLIENT_TIMEOUT_MS);
+
+  if (modbusServerStarted) {
+    Serial.println("Modbus TCP server is running.");
   } else {
-    connected = mqttClient.connect(MQTT_CLIENT_ID);
-  }
-
-  if (connected) {
-    Serial.println("MQTT connected.");
-  } else {
-    Serial.printf("MQTT connection failed, state=%d\n", mqttClient.state());
+    Serial.println("Could not start the Modbus TCP server.");
   }
 }
 
-void publishLatestData() {
-  if (!mqttClient.connected()) {
-    return;
-  }
-
-  SensorData snapshot;
-  bool haveData = false;
-
-  portENTER_CRITICAL(&dataMux);
-  if (dataReady) {
-    snapshot = latestData;
-    haveData = true;
-  }
-  portEXIT_CRITICAL(&dataMux);
-
-  if (!haveData) {
-    return;
-  }
-
-  const float temperatureC = snapshot.temperatureTenths / 10.0f;
-  const float humidityPct = snapshot.humidityTenths / 10.0f;
-  const float pressureHpa = snapshot.pressureTenths / 10.0f;
-
-  const time_t nowEpoch = time(nullptr);
-  char payload[256];
-  int payloadLength;
-
-  if (nowEpoch > 1700000000) {
-    payloadLength = snprintf(
-        payload, sizeof(payload),
-        "{\"gateway_id\":\"ESP32_GATEWAY_01\",\"source_id\":\"ESP32_SENSOR_01\","
-        "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,"
-        "\"timestamp\":%lld}",
-        temperatureC, humidityPct, pressureHpa, static_cast<long long>(nowEpoch));
-  } else {
-    payloadLength = snprintf(
-        payload, sizeof(payload),
-        "{\"gateway_id\":\"ESP32_GATEWAY_01\",\"source_id\":\"ESP32_SENSOR_01\","
-        "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,"
-        "\"timestamp\":null}",
-        temperatureC, humidityPct, pressureHpa);
-  }
-
-  if (payloadLength <= 0 || payloadLength >= static_cast<int>(sizeof(payload))) {
-    Serial.println("Could not format MQTT payload.");
-    return;
-  }
-
-  if (mqttClient.publish(MQTT_TOPIC, payload)) {
-    Serial.printf("MQTT published to %s: %s\n", MQTT_TOPIC, payload);
-
-    // Only clear the flag if no newer Modbus sample arrived during publishing.
-    portENTER_CRITICAL(&dataMux);
-    if (latestData.sequence == snapshot.sequence) {
-      dataReady = false;
-    }
-    portEXIT_CRITICAL(&dataMux);
-  } else {
-    Serial.println("MQTT publish failed; latest sample will be retried.");
-  }
-}
-
-// -----------------------------------------------------------------------------
-// MODBUS POLLING
-// -----------------------------------------------------------------------------
-
-void pollModbusServer() {
-  // Don't queue requests until the sensor ESP32 has joined this access point.
-  if (WiFi.softAPgetStationNum() == 0) {
-    return;
-  }
-
-  const uint32_t now = millis();
-  if (now - lastModbusPollMs < MODBUS_POLL_INTERVAL_MS) {
-    return;
-  }
-  lastModbusPollMs = now;
-
-  portENTER_CRITICAL(&dataMux);
-  const bool alreadyPending = modbusRequestPending;
-  if (!alreadyPending) {
-    modbusRequestPending = true;
-  }
-  portEXIT_CRITICAL(&dataMux);
-
-  if (alreadyPending) {
-    return;
-  }
-
-  const uint32_t token = nextRequestToken++;
-  const Error result = modbusClient.addRequest(
-      token,
-      MODBUS_UNIT_ID,
-      0x03, // Read Holding Registers
-      MODBUS_START_ADDRESS,
-      MODBUS_REGISTER_COUNT);
-
-  if (result != SUCCESS) {
-    Serial.printf("Could not queue Modbus request, error=%u\n",
-                  static_cast<unsigned>(result));
-    portENTER_CRITICAL(&dataMux);
-    modbusRequestPending = false;
-    portEXIT_CRITICAL(&dataMux);
-  }
-}
-
-// -----------------------------------------------------------------------------
-// SETUP / LOOP
-// -----------------------------------------------------------------------------
-
+// ----------------------------- Arduino setup/loop --------------------------
 void setup() {
   Serial.begin(115200);
   delay(300);
+
   Serial.println();
-  Serial.println("ESP32 Modbus-to-MQTT gateway starting...");
+  Serial.println("ESP32 sensor unit - Modbus TCP server");
+  Serial.println("--------------------------------------");
 
-  startWifi();
+  updateHoldingRegisters();
+  lastSensorUpdateMs = millis();
 
-#if MQTT_USE_TLS
-  mqttTransport.setCACert(MQTT_CA_CERT);
-#endif
-
-  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(512);
-  mqttClient.setKeepAlive(30);
-  mqttClient.setSocketTimeout(5);
-
-  // Synchronize the system clock for a useful Unix timestamp in MQTT messages.
-  // This does not block startup; timestamp remains null until time is available.
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
-
-  modbusClient.setTimeout(1500);
-  modbusClient.onResponseHandler(onModbusResponse);
-  modbusClient.begin();
-
-  Serial.println("Gateway initialized.");
-  Serial.printf("Modbus target: %s:%u\n",
-                MODBUS_SERVER_IP.toString().c_str(), MODBUS_PORT);
+  startWiFi();
 }
 
 void loop() {
-  maintainWifi();
-  maintainMqtt();
+  maintainWiFi();
+  startModbusServerWhenConnected();
 
-  if (mqttClient.connected()) {
-    mqttClient.loop();
+  const uint32_t now = millis();
+  if (now - lastSensorUpdateMs >= SENSOR_UPDATE_INTERVAL_MS) {
+    lastSensorUpdateMs = now;
+    updateHoldingRegisters();
   }
 
-  pollModbusServer();
-  publishLatestData();
+  static uint32_t lastStatusPrintMs = 0;
+  if (modbusServerStarted && now - lastStatusPrintMs >= 10000) {
+    lastStatusPrintMs = now;
+    Serial.printf("Modbus server active clients: %u\n", modbusServer.activeClients());
+  }
 
-  delay(5);
+  delay(10);
 }
