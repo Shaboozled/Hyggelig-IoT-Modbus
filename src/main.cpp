@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <math.h>
+#include <DHT.h>
 
 #include "ModbusServerWiFi.h"
 
@@ -21,9 +22,6 @@
 //   Start address:         0 (zero-based; commonly documented as 40001)
 //   Register count:        3
 //
-// IMPORTANT: readSensorValues() currently returns DEMO values. Replace that
-// function with reads from your actual sensors when you decide which sensors
-// and libraries to use.
 // ============================================================================
 
 // ----------------------------- Wi-Fi settings -------------------------------
@@ -51,18 +49,19 @@ static constexpr uint16_t REG_PRESSURE = 2;
 static constexpr uint16_t REGISTER_COUNT = 3;
 
 // ----------------------------- Sensor settings -----------------------------
-static constexpr uint32_t SENSOR_UPDATE_INTERVAL_MS = 1000;
+static constexpr uint32_t SENSOR_UPDATE_INTERVAL_MS = 2000;
+static const uint8_t DHT_DATA_PIN = 4;  // GPIO pin connected to the DHT11 data line
+DHT dht(DHT_DATA_PIN, DHT11);
 
 struct SensorValues {
   float temperatureC;
   float humidityPercent;
-  float pressureHpa;
 };
 
 // Shared holding-register values.
 // Register 0: signed temperature, tenths of degrees C (e.g. 235 = 23.5 C)
 // Register 1: unsigned humidity, tenths of percent (e.g. 552 = 55.2 %)
-// Register 2: unsigned pressure, tenths of hPa (e.g. 10132 = 1013.2 hPa)
+// Register 2: pressure in tenths of hPa (not measured by the DHT11; remains 0)
 static uint16_t holdingRegisters[REGISTER_COUNT] = {0, 0, 0};
 static portMUX_TYPE registerMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -71,15 +70,17 @@ static bool modbusServerStarted = false;
 static uint32_t lastSensorUpdateMs = 0;
 static uint32_t lastWifiRetryMs = 0;
 
-// ---------------------------- Sensor placeholder ---------------------------
-SensorValues readSensorValues() {
-  // DEMO VALUES ONLY.
-  // Replace these three values with measurements from your real sensors.
-  // For example:
-  //   values.temperatureC = yourTemperatureSensor.readCelsius();
-  //   values.humidityPercent = yourHumiditySensor.readHumidity();
-  //   values.pressureHpa = yourPressureSensor.readPressure() / 100.0f;
-  return {23.5f, 55.2f, 1013.2f};
+// ---------------------------- Sensor readings ------------------------------
+bool readSensorValues(SensorValues &values) {
+  values.temperatureC = dht.readTemperature();
+  values.humidityPercent = dht.readHumidity();
+
+  if (!isfinite(values.temperatureC) || !isfinite(values.humidityPercent)) {
+    Serial.println("WARNING: Failed to read the DHT11 sensor.");
+    return false;
+  }
+
+  return true;
 }
 
 // Convert a signed floating-point measurement to signed tenths.
@@ -106,24 +107,24 @@ uint16_t encodeUnsignedTenths(float value) {
 }
 
 void updateHoldingRegisters() {
-  const SensorValues values = readSensorValues();
+  SensorValues values;
+  if (!readSensorValues(values)) {
+    return;
+  }
 
   // Store signed temperature as its 16-bit two's-complement representation.
   const int16_t temperatureRaw = encodeSignedTenths(values.temperatureC);
   const uint16_t humidityRaw = encodeUnsignedTenths(values.humidityPercent);
-  const uint16_t pressureRaw = encodeUnsignedTenths(values.pressureHpa);
 
   // The Modbus server callback runs in a separate task, so protect shared data.
   portENTER_CRITICAL(&registerMux);
   holdingRegisters[REG_TEMPERATURE] = static_cast<uint16_t>(temperatureRaw);
   holdingRegisters[REG_HUMIDITY] = humidityRaw;
-  holdingRegisters[REG_PRESSURE] = pressureRaw;
   portEXIT_CRITICAL(&registerMux);
 
-  Serial.printf("Sensor values updated: T=%.1f C, RH=%.1f %%, P=%.1f hPa\n",
+  Serial.printf("DHT11 values updated: T=%.1f C, RH=%.1f %%\n",
                 temperatureRaw / 10.0f,
-                humidityRaw / 10.0f,
-                pressureRaw / 10.0f);
+                humidityRaw / 10.0f);
 }
 
 // -------------------------- Modbus request handler -------------------------
@@ -234,6 +235,7 @@ void setup() {
   Serial.println("ESP32 sensor unit - Modbus TCP server");
   Serial.println("--------------------------------------");
 
+  dht.begin();
   updateHoldingRegisters();
   lastSensorUpdateMs = millis();
 
