@@ -1,5 +1,7 @@
 # Hyggelig IoT Modbus
 
-The ESP32 gateway reads temperature and humidity from the DHT11 ESP32 over Modbus TCP and samples the MQ-135 on GPIO34. It publishes Sparkplug B over MQTT/TLS. The gateway is edge node `esp32-01` and sends MQ-135 readings as `NDATA`. The DHT11 is device `esp32-02` and its readings are sent as `DDATA` after `DBIRTH`. The DHT11 server firmware is on the `ModBus-Server` branch.
+ESP32-gatewayen læser temperatur og luftfugtighed fra DHT11-enheden via Modbus TCP og aflæser MQ-135 på GPIO34. Gatewayen sender målingerne som Sparkplug B over MQTT/TLS. Gatewayen er edge node `esp32-01` og sender MQ-135-målinger som `NDATA`. DHT11 er enhed `esp32-02`, og dens målinger sendes som `DDATA` efter `DBIRTH`. Firmwaren til DHT11-serveren ligger på branchen `ModBus-Server`.
 
-Copy `src/wifi_local.example.h` to `src/wifi_local.h` and set the gateway's Wi-Fi details before uploading with PlatformIO. The local AP details must match the DHT11 server. Git ignores `src/wifi_local.h`.
+Kopiér `src/wifi_local.example.h` til `src/wifi_local.h`, og udfyld gatewayens Wi‑Fi-oplysninger før upload med PlatformIO. Indstillingerne for det lokale adgangspunkt skal matche DHT11-serverens. Git ignorerer `src/wifi_local.h`.
+
+Gatewayen deler én 2,4 GHz-radio mellem hotspottet og det lokale Modbus-netværk. Ved opstart søger den efter det konfigurerede hotspot. Hvis den finder det, bruger det lokale adgangspunkt samme kanal. Den serielle log viser genforbindelsesforsøg og fejlkoder ved afbrydelser. Wi‑Fi-forbindelsen kan stadig være ustabil, så der kan være huller mellem nye målinger i QuestDB.

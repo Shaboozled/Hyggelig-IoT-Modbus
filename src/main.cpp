@@ -238,23 +238,55 @@ void onModbusResponse(ModbusMessage message, uint32_t token) {
 // -----------------------------------------------------------------------------
 
 void startWifi() {
-  WiFi.mode(WIFI_AP_STA);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      Serial.printf("Uplink Wi-Fi disconnect reason=%u\n", info.wifi_sta_disconnected.reason);
+    } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.println("Uplink Wi-Fi connected; IP assigned");
+    }
+  });
+  WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(false);
 
+  // The gateway uses one radio. Start its Modbus AP on the uplink's channel
+  // when the hotspot is visible, so joining it need not move the AP.
+  uint8_t channel = AP_CHANNEL;
+  bool uplinkSeen = false;
+  int32_t strongest = INT32_MIN;
+  const int found = WiFi.scanNetworks(false, true);
+  for (int i = 0; i < found; ++i) {
+    if (WiFi.SSID(i) == UPLINK_SSID && WiFi.RSSI(i) > strongest) {
+      channel = WiFi.channel(i);
+      strongest = WiFi.RSSI(i);
+      uplinkSeen = true;
+    }
+  }
+  WiFi.scanDelete();
+  Serial.printf("Uplink Wi-Fi %s at startup; local AP channel=%u\n",
+                uplinkSeen ? "visible" : "not found", channel);
+  lastWifiRetryMs = millis();
+  WiFi.begin(UPLINK_SSID, UPLINK_PASSWORD, uplinkSeen ? channel : 0);
+  if (uplinkSeen) {
+    // Give the hotspot a chance to authenticate before starting the local AP.
+    while (WiFi.status() != WL_CONNECTED && millis() - lastWifiRetryMs < 6000) {
+      delay(50);
+    }
+    Serial.printf("Uplink Wi-Fi status before local AP: %d\n", WiFi.status());
+    if (WiFi.status() == WL_CONNECTED) channel = WiFi.channel();
+  }
+  WiFi.mode(WIFI_AP_STA);
   if (!WiFi.softAPConfig(AP_IP, AP_IP, AP_SUBNET)) {
     Serial.println("Could not configure the local AP IP settings.");
   }
 
-  if (!WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, 1)) {
+  if (!WiFi.softAP(AP_SSID, AP_PASSWORD, channel, 0, 1)) {
     Serial.println("Failed to start the local Wi-Fi access point.");
   } else {
     Serial.printf("Local AP started: SSID=%s, IP=%s\n",
                   AP_SSID, WiFi.softAPIP().toString().c_str());
   }
 
-  // This station connection is ONLY for the gateway's own MQTT/internet traffic.
-  WiFi.begin(UPLINK_SSID, UPLINK_PASSWORD);
   Serial.printf("Connecting to upstream Wi-Fi: %s\n", UPLINK_SSID);
 }
 
@@ -267,7 +299,7 @@ void maintainWifi() {
   if (now - lastWifiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
     lastWifiRetryMs = now;
     Serial.println("Upstream Wi-Fi disconnected; requesting reconnect...");
-    WiFi.reconnect();
+    WiFi.begin(UPLINK_SSID, UPLINK_PASSWORD);
   }
 }
 
