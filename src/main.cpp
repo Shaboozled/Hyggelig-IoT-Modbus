@@ -3,33 +3,33 @@
 #include <time.h>
 #include <math.h>
 
-#include <PubSubClient.h>
+#include <Preferences.h>
+#include <mqtt_client.h>
+#include <sys/time.h>
+#include <atomic>
 
-// Set to 1 below to use TLS for a public/internet MQTT broker.
-#define MQTT_USE_TLS 1
+#include "sparkplug_encoder.h"
+
+#if __has_include("wifi_local.h")
+#include "wifi_local.h"
+#else
+#include "wifi_local.example.h"
+#endif
 
 // eModbus: asynchronous Modbus TCP client
 #include "ModbusClientTCP.h"
 #include "ModbusMessage.h"
 
-#if MQTT_USE_TLS
-#include <WiFiClientSecure.h>
-#else
 #include <WiFiClient.h>
-#endif
 
 // -----------------------------------------------------------------------------
 // USER CONFIGURATION - EDIT THESE VALUES
 // -----------------------------------------------------------------------------
 
 // Local Wi-Fi network created by THIS gateway ESP32.
-static const char *AP_SSID = "ESP32_LOCAL";
-static const char *AP_PASSWORD = "ChangeThisAPPassword"; // At least 8 characters
 static const uint8_t AP_CHANNEL = 6; // AP+STA ultimately follows the upstream AP channel
 
 // Wi-Fi network that provides internet access to this gateway.
-static const char *UPLINK_SSID = "Emil's Galaxy S22 Ultra";
-static const char *UPLINK_PASSWORD = "12345678";
 
 // Static IP of the OTHER ESP32 (the Modbus TCP server) on this gateway's AP network.
 // Configure the other ESP32 to use this address, subnet and gateway.
@@ -40,7 +40,7 @@ static constexpr uint8_t MODBUS_UNIT_ID = 1;
 // Modbus function 0x03 = Read Holding Registers.
 // Protocol addresses are zero-based: address 0 is often labelled 40001 in manuals.
 static constexpr uint16_t MODBUS_START_ADDRESS = 0;
-static constexpr uint16_t MODBUS_REGISTER_COUNT = 3;
+static constexpr uint16_t MODBUS_REGISTER_COUNT = 2;
 static constexpr uint32_t MODBUS_POLL_INTERVAL_MS = 2000;
 
 // Register map expected from the other ESP32:
@@ -51,18 +51,14 @@ static constexpr uint32_t MODBUS_POLL_INTERVAL_MS = 2000;
 // Mosquitto broker reachable through the UPLINK Wi-Fi network.
 // Example for a broker on your LAN: host = PC/server LAN IP, port = 1883.
 // Example for an internet-hosted broker: use its DNS name and normally TLS port 8883.
-static const char *MQTT_HOST = "gruppe7.vps.webdock.cloud";
-static constexpr uint16_t MQTT_PORT = 8883;
-static const char *MQTT_TOPIC = "factory/machine01/sensors";
-static const char *MQTT_CLIENT_ID = "ESP32-01"; // Must be unique for this broker
-static const char *MQTT_USERNAME = ""; // Leave empty if broker has no username
-static const char *MQTT_PASSWORD = ""; // Leave empty if broker has no password
-
-// source_id values used in the MQTT JSON payloads (same topic, different source).
-static const char *GATEWAY_ID = "ESP32_GATEWAY_01";
-static const char *MODBUS_SOURCE_ID = "ESP32_SENSOR_01";
-static const char *GAS_SOURCE_ID = "ESP32-02";
-
+static constexpr char MQTT_URI[] = "mqtts://gruppe7.vps.webdock.cloud:8883";
+static constexpr char MQTT_CLIENT_ID[] = "esp32-01-sparkplug";
+static constexpr char NODE_BIRTH[] = "spBv1.0/Group7/NBIRTH/esp32-01";
+static constexpr char NODE_DATA[] = "spBv1.0/Group7/NDATA/esp32-01";
+static constexpr char NODE_DEATH[] = "spBv1.0/Group7/NDEATH/esp32-01";
+static constexpr char DEVICE_BIRTH[] = "spBv1.0/Group7/DBIRTH/esp32-01/esp32-02";
+static constexpr char DEVICE_DATA[] = "spBv1.0/Group7/DDATA/esp32-01/esp32-02";
+static constexpr char NODE_COMMAND[] = "spBv1.0/Group7/NCMD/esp32-01";
 // -----------------------------------------------------------------------------
 // MQ-135 GAS SENSOR (analog output wired directly to THIS gateway ESP32)
 // -----------------------------------------------------------------------------
@@ -101,7 +97,6 @@ static constexpr uint8_t GAS_ADC_SAMPLES = 16;         // averaged per reading
 // 0 = plain MQTT (suitable for an isolated local-network test only).
 // 1 = MQTT over TLS (recommended for a broker reached over the public internet).
 
-#if MQTT_USE_TLS
 // Paste the PEM CA certificate that validates your broker's TLS certificate.
 // Do not use setInsecure() for a production/public-internet connection.
 static const char *MQTT_CA_CERT = R"PEM(
@@ -128,7 +123,6 @@ or/CVw6ngisBhyT1C+zRPjP6d/35kjxwBvV735WHeY5JAxO5VhPWMYHBEfxFlzD9
 svNEmD46vDagMOs3qek5pjRsCIidzw81o7kSTg/g3Ii/YWHfMg==
 -----END CERTIFICATE-----
 )PEM";
-#endif
 
 static constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 static constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
@@ -143,13 +137,23 @@ static const IPAddress AP_SUBNET(255, 255, 255, 0);
 WiFiClient modbusTcpSocket;
 ModbusClientTCP modbusClient(modbusTcpSocket, MODBUS_SERVER_IP, MODBUS_PORT);
 
-#if MQTT_USE_TLS
-WiFiClientSecure mqttTransport;
-#else
-WiFiClient mqttTransport;
-#endif
-PubSubClient mqttClient(mqttTransport);
+static esp_mqtt_client_handle_t mqttClient = nullptr;
+static Preferences mqttPreferences;
+static std::atomic<bool> mqttConnected{false};
+static std::atomic<bool> mqttReconnect{false};
+static std::atomic<bool> birthPending{false};
+static uint8_t bdSeq = 255;
+static uint8_t sequence = 0;
+static bool deviceBorn = false;
+static bool sessionRecorded = false;
+static sparkplug::Buffer will;
 
+static uint64_t utc_milliseconds() {
+  timeval now{};
+  gettimeofday(&now, nullptr);
+  if (now.tv_sec < 1700000000) return 0;
+  return uint64_t(now.tv_sec) * 1000 + now.tv_usec / 1000;
+}
 // -----------------------------------------------------------------------------
 // SHARED DATA (Modbus callback runs on the library's worker task)
 // -----------------------------------------------------------------------------
@@ -157,7 +161,7 @@ PubSubClient mqttClient(mqttTransport);
 struct SensorData {
   int16_t temperatureTenths;
   uint16_t humidityTenths;
-  uint16_t pressureTenths;
+  uint64_t observedAt;
   uint32_t sequence;
 };
 
@@ -173,6 +177,7 @@ static uint32_t lastWifiRetryMs = 0;
 
 // MQ-135 data is only touched from loop(), so no critical section is needed.
 struct GasData {
+  uint64_t observedAt;
   float sensorMv;  // analog output voltage at the module (after undoing the divider)
   float rsKohm;    // computed sensor resistance, NAN if not computable
   float co2Ppm;    // estimated CO2 ppm, NAN if R0 isn't calibrated
@@ -200,8 +205,7 @@ void onModbusResponse(ModbusMessage message, uint32_t token) {
   }
 
   // FC03 response layout: [unit id][function][byte count][register data...]
-  // Three 16-bit registers require 3 + (3 * 2) = 9 bytes in this message.
-  if (message.getFunctionCode() != 0x03 || message.size() < 9) {
+  if (message.getFunctionCode() != 0x03 || message.size() != 7 || message[2] != 4) {
     Serial.println("Modbus response had an unexpected function or length.");
     portENTER_CRITICAL(&dataMux);
     modbusRequestPending = false;
@@ -211,26 +215,22 @@ void onModbusResponse(ModbusMessage message, uint32_t token) {
 
   int16_t temperatureRaw = 0;
   uint16_t humidityRaw = 0;
-  uint16_t pressureRaw = 0;
 
   // Data begins at byte offset 3 in the Modbus response message.
   message.get(3, temperatureRaw);
   message.get(5, humidityRaw);
-  message.get(7, pressureRaw);
+  const uint64_t observedAt = utc_milliseconds();
 
   portENTER_CRITICAL(&dataMux);
   latestData.temperatureTenths = temperatureRaw;
   latestData.humidityTenths = humidityRaw;
-  latestData.pressureTenths = pressureRaw;
+  latestData.observedAt = observedAt;
   latestData.sequence++;
   dataReady = true;
   modbusRequestPending = false;
   portEXIT_CRITICAL(&dataMux);
 
-  Serial.printf("Modbus OK: T=%.1f C, RH=%.1f %%, P=%.1f hPa\n",
-                temperatureRaw / 10.0f,
-                humidityRaw / 10.0f,
-                pressureRaw / 10.0f);
+  Serial.printf("Modbus OK: T=%.1f C, RH=%.1f %%\n", temperatureRaw / 10.0f, humidityRaw / 10.0f);
 }
 
 // -----------------------------------------------------------------------------
@@ -275,140 +275,131 @@ void maintainWifi() {
 // MQTT
 // -----------------------------------------------------------------------------
 
-void maintainMqtt() {
-  if (WiFi.status() != WL_CONNECTED || mqttClient.connected()) {
-    return;
+static void on_mqtt(void*, esp_event_base_t, int32_t id, void* data) {
+  auto event = static_cast<esp_mqtt_event_handle_t>(data);
+  if (id == MQTT_EVENT_CONNECTED) {
+    mqttConnected = true;
+    birthPending = true;
+    esp_mqtt_client_subscribe(event->client, NODE_COMMAND, 1);
+  } else if (id == MQTT_EVENT_DISCONNECTED || id == MQTT_EVENT_ERROR) {
+    mqttConnected = false;
+    mqttReconnect = true;
+  } else if (id == MQTT_EVENT_DATA &&
+             event->topic_len == sizeof(NODE_COMMAND) - 1 &&
+             event->data_len == event->total_data_len &&
+             !memcmp(event->topic, NODE_COMMAND, sizeof(NODE_COMMAND) - 1) &&
+             sparkplug::is_rebirth(reinterpret_cast<const uint8_t*>(event->data), event->data_len)) {
+    birthPending = true;
   }
+}
+
+void maintainMqtt() {
+  if (mqttClient && mqttReconnect.exchange(false)) {
+    esp_mqtt_client_stop(mqttClient);
+    esp_mqtt_client_destroy(mqttClient);
+    mqttClient = nullptr;
+  }
+  if (mqttConnected && !sessionRecorded) {
+    mqttPreferences.putUChar("bd-seq", bdSeq);
+    sessionRecorded = true;
+  }
+  if (mqttClient || WiFi.status() != WL_CONNECTED || !utc_milliseconds()) return;
 
   const uint32_t now = millis();
-  if (now - lastMqttAttemptMs < MQTT_RECONNECT_INTERVAL_MS) {
-    return;
-  }
+  if (now - lastMqttAttemptMs < MQTT_RECONNECT_INTERVAL_MS) return;
   lastMqttAttemptMs = now;
+  bdSeq = mqttPreferences.getUChar("bd-seq", 255) + 1;
+  sessionRecorded = false;
 
-  Serial.printf("Connecting to MQTT broker %s:%u...\n", MQTT_HOST, MQTT_PORT);
-
-  bool connected = false;
-  if (strlen(MQTT_USERNAME) > 0) {
-    connected = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
-  } else {
-    connected = mqttClient.connect(MQTT_CLIENT_ID);
-  }
-
-  if (connected) {
-    Serial.println("MQTT connected.");
-  } else {
-    Serial.printf("MQTT connection failed, state=%d\n", mqttClient.state());
+  const auto timestamp = utc_milliseconds();
+  will = sparkplug::payload(timestamp, -1);
+  sparkplug::add_bd_seq(will, timestamp, bdSeq);
+  esp_mqtt_client_config_t config{};
+  config.uri = MQTT_URI;
+  config.client_id = MQTT_CLIENT_ID;
+  config.cert_pem = MQTT_CA_CERT;
+  config.lwt_topic = NODE_DEATH;
+  config.lwt_msg = reinterpret_cast<const char*>(will.data);
+  config.lwt_msg_len = will.size;
+  config.lwt_qos = 1;
+  config.keepalive = 30;
+  config.disable_auto_reconnect = true;
+  config.network_timeout_ms = 5000;
+  mqttReconnect = false;
+  mqttClient = esp_mqtt_client_init(&config);
+  if (!mqttClient) return;
+  if (esp_mqtt_client_register_event(mqttClient, MQTT_EVENT_ANY, on_mqtt, nullptr) != ESP_OK ||
+      esp_mqtt_client_start(mqttClient) != ESP_OK) {
+    esp_mqtt_client_destroy(mqttClient);
+    mqttClient = nullptr;
   }
 }
 
-// Writes the Unix time as a number, or the JSON literal null if the clock isn't synced yet.
-static void formatTimestamp(char *out, size_t outSize) {
-  const time_t nowEpoch = time(nullptr);
-  if (nowEpoch > 1700000000) {
-    snprintf(out, outSize, "%lld", static_cast<long long>(nowEpoch));
-  } else {
-    snprintf(out, outSize, "null");
+static bool publish_sparkplug(const char* topic, const sparkplug::Buffer& message) {
+  if (message.valid && mqttConnected &&
+      esp_mqtt_client_publish(mqttClient, topic,
+          reinterpret_cast<const char*>(message.data), message.size, 0, false) >= 0) {
+    ++sequence;
+    return true;
   }
+  return false;
 }
 
-// Writes a float with the given printf format, or the JSON literal null if it is NaN/inf.
-static void formatFloatOrNull(char *out, size_t outSize, const char *fmt, float value) {
-  if (isnan(value) || isinf(value)) {
-    snprintf(out, outSize, "null");
-  } else {
-    snprintf(out, outSize, fmt, value);
-  }
+static bool publish_node_birth() {
+  const auto time = utc_milliseconds();
+  if (!time) return false;
+  sequence = 0;
+  deviceBorn = false;
+  auto message = sparkplug::payload(time, sequence);
+  sparkplug::add_bd_seq(message, time, bdSeq);
+  sparkplug::add_rebirth_control(message, time);
+  const bool available = latestGas.observedAt != 0;
+  sparkplug::add_double(message, "sensor_mv", 1, time, available ? latestGas.sensorMv : NAN);
+  sparkplug::add_double(message, "rs_kohm", 2, time, available ? latestGas.rsKohm : NAN);
+  sparkplug::add_double(message, "co2_ppm_est", 3, time, available ? latestGas.co2Ppm : NAN);
+  if (!publish_sparkplug(NODE_BIRTH, message)) return false;
+  Serial.println("Sparkplug NBIRTH sent");
+  return true;
 }
 
 void publishLatestData() {
-  if (!mqttClient.connected()) {
-    return;
-  }
-
   SensorData snapshot;
-  bool haveData = false;
-
+  bool ready;
   portENTER_CRITICAL(&dataMux);
-  if (dataReady) {
-    snapshot = latestData;
-    haveData = true;
-  }
+  snapshot = latestData;
+  ready = dataReady;
   portEXIT_CRITICAL(&dataMux);
-
-  if (!haveData) {
-    return;
+  if (!snapshot.observedAt) return;
+  const auto time = utc_milliseconds();
+  if (!time) return;
+  if (!deviceBorn) {
+    auto birth = sparkplug::payload(time, sequence);
+    sparkplug::add_double(birth, "temperature_c", 4, snapshot.observedAt, snapshot.temperatureTenths / 10.0);
+    sparkplug::add_double(birth, "humidity_pct", 5, snapshot.observedAt, snapshot.humidityTenths / 10.0);
+    if (!publish_sparkplug(DEVICE_BIRTH, birth)) return;
+    deviceBorn = true;
+    Serial.println("Sparkplug DBIRTH sent");
   }
-
-  const float temperatureC = snapshot.temperatureTenths / 10.0f;
-  const float humidityPct = snapshot.humidityTenths / 10.0f;
-  const float pressureHpa = snapshot.pressureTenths / 10.0f;
-
-  char timestamp[24];
-  formatTimestamp(timestamp, sizeof(timestamp));
-
-  char payload[256];
-  const int payloadLength = snprintf(
-      payload, sizeof(payload),
-      "{\"gateway_id\":\"%s\",\"source_id\":\"%s\","
-      "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,"
-      "\"timestamp\":%s}",
-      GATEWAY_ID, MODBUS_SOURCE_ID,
-      temperatureC, humidityPct, pressureHpa, timestamp);
-
-  if (payloadLength <= 0 || payloadLength >= static_cast<int>(sizeof(payload))) {
-    Serial.println("Could not format MQTT payload.");
-    return;
-  }
-
-  if (mqttClient.publish(MQTT_TOPIC, payload)) {
-    Serial.printf("MQTT published to %s: %s\n", MQTT_TOPIC, payload);
-
-    // Only clear the flag if no newer Modbus sample arrived during publishing.
+  if (!ready) return;
+  auto message = sparkplug::payload(time, sequence);
+  sparkplug::add_double(message, nullptr, 4, snapshot.observedAt, snapshot.temperatureTenths / 10.0);
+  sparkplug::add_double(message, nullptr, 5, snapshot.observedAt, snapshot.humidityTenths / 10.0);
+  if (publish_sparkplug(DEVICE_DATA, message)) {
     portENTER_CRITICAL(&dataMux);
-    if (latestData.sequence == snapshot.sequence) {
-      dataReady = false;
-    }
+    if (latestData.sequence == snapshot.sequence) dataReady = false;
     portEXIT_CRITICAL(&dataMux);
-  } else {
-    Serial.println("MQTT publish failed; latest sample will be retried.");
   }
 }
 
 void publishGasData() {
-  if (!gasReady || !mqttClient.connected()) {
-    return;
-  }
-
-  const GasData snapshot = latestGas;
-
-  char timestamp[24];
-  char rsText[16];
-  char ppmText[16];
-  formatTimestamp(timestamp, sizeof(timestamp));
-  formatFloatOrNull(rsText, sizeof(rsText), "%.2f", snapshot.rsKohm);
-  formatFloatOrNull(ppmText, sizeof(ppmText), "%.0f", snapshot.co2Ppm);
-
-  char payload[256];
-  const int payloadLength = snprintf(
-      payload, sizeof(payload),
-      "{\"gateway_id\":\"%s\",\"source_id\":\"%s\","
-      "\"sensor_mv\":%.0f,\"rs_kohm\":%s,\"co2_ppm_est\":%s,"
-      "\"timestamp\":%s}",
-      GATEWAY_ID, GAS_SOURCE_ID,
-      snapshot.sensorMv, rsText, ppmText, timestamp);
-
-  if (payloadLength <= 0 || payloadLength >= static_cast<int>(sizeof(payload))) {
-    Serial.println("Could not format MQ-135 MQTT payload.");
-    return;
-  }
-
-  if (mqttClient.publish(MQTT_TOPIC, payload)) {
-    Serial.printf("MQTT published to %s: %s\n", MQTT_TOPIC, payload);
-    gasReady = false;
-  } else {
-    Serial.println("MQTT publish (MQ-135) failed; latest sample will be retried.");
-  }
+  if (!gasReady || !latestGas.observedAt) return;
+  const auto time = utc_milliseconds();
+  if (!time) return;
+  auto message = sparkplug::payload(time, sequence);
+  sparkplug::add_double(message, nullptr, 1, latestGas.observedAt, latestGas.sensorMv);
+  sparkplug::add_double(message, nullptr, 2, latestGas.observedAt, latestGas.rsKohm);
+  sparkplug::add_double(message, nullptr, 3, latestGas.observedAt, latestGas.co2Ppm);
+  if (publish_sparkplug(NODE_DATA, message)) gasReady = false;
 }
 
 // -----------------------------------------------------------------------------
@@ -458,6 +449,7 @@ void sampleGasSensor() {
     Serial.printf("MQ-135: reading out of range (pin=%.0f mV). Check wiring/divider.\n", pinMv);
   }
 
+  latestGas.observedAt = utc_milliseconds();
   latestGas.sensorMv = sensorMv;
   latestGas.rsKohm = rsKohm;
   latestGas.co2Ppm = co2Ppm;
@@ -527,17 +519,8 @@ void setup() {
 
   startWifi();
 
-#if MQTT_USE_TLS
-  mqttTransport.setCACert(MQTT_CA_CERT);
-#endif
-
-  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setBufferSize(512);
-  mqttClient.setKeepAlive(30);
-  mqttClient.setSocketTimeout(5);
-
-  // Synchronize the system clock for a useful Unix timestamp in MQTT messages.
-  // This does not block startup; timestamp remains null until time is available.
+  mqttPreferences.begin("sparkplug", false);
+  // The gateway waits for the UTC clock before opening the Sparkplug session.
   configTime(0, 0, "pool.ntp.org", "time.google.com");
 
   modbusClient.setTimeout(1500);
@@ -553,15 +536,15 @@ void loop() {
   maintainWifi();
   maintainMqtt();
 
-  if (mqttClient.connected()) {
-    mqttClient.loop();
-  }
-
   pollModbusServer();
   sampleGasSensor();
 
-  publishLatestData();
-  publishGasData();
-
+  if (mqttConnected) {
+    if (birthPending.exchange(false) && !publish_node_birth()) birthPending = true;
+    if (!birthPending) {
+      publishLatestData();
+      publishGasData();
+    }
+  }
   delay(5);
 }
