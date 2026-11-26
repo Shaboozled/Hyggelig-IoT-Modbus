@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
-#include <math.h>
 
 #include <PubSubClient.h>
 
@@ -28,8 +27,8 @@ static const char *AP_PASSWORD = "ChangeThisAPPassword"; // At least 8 character
 static const uint8_t AP_CHANNEL = 6; // AP+STA ultimately follows the upstream AP channel
 
 // Wi-Fi network that provides internet access to this gateway.
-static const char *UPLINK_SSID = "Emil's Galaxy S22 Ultra";
-static const char *UPLINK_PASSWORD = "12345678";
+static const char *UPLINK_SSID = "MotorolaEdge20";
+static const char *UPLINK_PASSWORD = "projektlille";
 
 // Static IP of the OTHER ESP32 (the Modbus TCP server) on this gateway's AP network.
 // Configure the other ESP32 to use this address, subnet and gateway.
@@ -54,49 +53,9 @@ static constexpr uint32_t MODBUS_POLL_INTERVAL_MS = 2000;
 static const char *MQTT_HOST = "gruppe7.vps.webdock.cloud";
 static constexpr uint16_t MQTT_PORT = 8883;
 static const char *MQTT_TOPIC = "factory/machine01/sensors";
-static const char *MQTT_CLIENT_ID = "ESP32-01"; // Must be unique for this broker
+static const char *MQTT_CLIENT_ID = "ESP32_1"; // Must be unique for this broker
 static const char *MQTT_USERNAME = ""; // Leave empty if broker has no username
 static const char *MQTT_PASSWORD = ""; // Leave empty if broker has no password
-
-// source_id values used in the MQTT JSON payloads (same topic, different source).
-static const char *GATEWAY_ID = "ESP32_GATEWAY_01";
-static const char *MODBUS_SOURCE_ID = "ESP32_SENSOR_01";
-static const char *GAS_SOURCE_ID = "ESP32-02";
-
-// -----------------------------------------------------------------------------
-// MQ-135 GAS SENSOR (analog output wired directly to THIS gateway ESP32)
-// -----------------------------------------------------------------------------
-
-// MUST be an ADC1 pin (GPIO32-39). ADC2 pins do not work while Wi-Fi is active.
-// GPIO34 is input-only, which is ideal here.
-static constexpr uint8_t MQ135_PIN = 34;
-
-// The MQ-135 module's AO pin can swing up to its supply voltage (5 V), but the
-// ESP32 ADC tolerates 3.3 V max. Use a voltage divider between AO and the pin.
-// Ratio = (R1 + R2) / R2 where R1 is AO->pin and R2 is pin->GND.
-// Two equal resistors (e.g. 10k + 10k) give a ratio of 2.0 (5 V -> 2.5 V).
-static constexpr float MQ135_DIVIDER_RATIO = 2.0f;
-
-// Voltage the module is powered from (in millivolts).
-static constexpr float MQ135_SUPPLY_MV = 5000.0f;
-
-// Load resistor on the module in kOhm. Most modules use 1k-20k; check your board.
-static constexpr float MQ135_RL_KOHM = 10.0f;
-
-// Sensor resistance in clean air (kOhm). 0 = not calibrated yet.
-// With 0, the ppm estimate is published as null, but the raw values are still sent.
-// To calibrate: let the sensor warm up (ideally 24 h+ the first time) in fresh air,
-// read the "R0 candidate" printed on Serial, and paste that value here.
-static constexpr float MQ135_R0_KOHM = 0.0f;
-
-// CO2 curve constants (commonly used for the MQ-135): ppm = A * (Rs/R0)^(-B)
-static constexpr float MQ135_CURVE_A = 116.6020682f;
-static constexpr float MQ135_CURVE_B = 2.769034857f;
-static constexpr float FRESH_AIR_CO2_PPM = 400.0f; // used only for the R0 suggestion
-
-static constexpr uint32_t MQ135_WARMUP_MS = 120000;   // no publishing until warmed up
-static constexpr uint32_t GAS_SAMPLE_INTERVAL_MS = 5000;
-static constexpr uint8_t GAS_ADC_SAMPLES = 16;         // averaged per reading
 
 // 0 = plain MQTT (suitable for an isolated local-network test only).
 // 1 = MQTT over TLS (recommended for a broker reached over the public internet).
@@ -170,17 +129,6 @@ static uint32_t nextRequestToken = 1;
 static uint32_t lastModbusPollMs = 0;
 static uint32_t lastMqttAttemptMs = 0;
 static uint32_t lastWifiRetryMs = 0;
-
-// MQ-135 data is only touched from loop(), so no critical section is needed.
-struct GasData {
-  float sensorMv;  // analog output voltage at the module (after undoing the divider)
-  float rsKohm;    // computed sensor resistance, NAN if not computable
-  float co2Ppm;    // estimated CO2 ppm, NAN if R0 isn't calibrated
-};
-
-static GasData latestGas = {};
-static bool gasReady = false;
-static uint32_t lastGasSampleMs = 0;
 
 // -----------------------------------------------------------------------------
 // MODBUS RESPONSE CALLBACK
@@ -302,25 +250,6 @@ void maintainMqtt() {
   }
 }
 
-// Writes the Unix time as a number, or the JSON literal null if the clock isn't synced yet.
-static void formatTimestamp(char *out, size_t outSize) {
-  const time_t nowEpoch = time(nullptr);
-  if (nowEpoch > 1700000000) {
-    snprintf(out, outSize, "%lld", static_cast<long long>(nowEpoch));
-  } else {
-    snprintf(out, outSize, "null");
-  }
-}
-
-// Writes a float with the given printf format, or the JSON literal null if it is NaN/inf.
-static void formatFloatOrNull(char *out, size_t outSize, const char *fmt, float value) {
-  if (isnan(value) || isinf(value)) {
-    snprintf(out, outSize, "null");
-  } else {
-    snprintf(out, outSize, fmt, value);
-  }
-}
-
 void publishLatestData() {
   if (!mqttClient.connected()) {
     return;
@@ -344,17 +273,25 @@ void publishLatestData() {
   const float humidityPct = snapshot.humidityTenths / 10.0f;
   const float pressureHpa = snapshot.pressureTenths / 10.0f;
 
-  char timestamp[24];
-  formatTimestamp(timestamp, sizeof(timestamp));
-
+  const time_t nowEpoch = time(nullptr);
   char payload[256];
-  const int payloadLength = snprintf(
-      payload, sizeof(payload),
-      "{\"gateway_id\":\"%s\",\"source_id\":\"%s\","
-      "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,"
-      "\"timestamp\":%s}",
-      GATEWAY_ID, MODBUS_SOURCE_ID,
-      temperatureC, humidityPct, pressureHpa, timestamp);
+  int payloadLength;
+
+  if (nowEpoch > 1700000000) {
+    payloadLength = snprintf(
+        payload, sizeof(payload),
+        "{\"gateway_id\":\"ESP32_GATEWAY_01\",\"source_id\":\"ESP32_SENSOR_01\","
+        "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,"
+        "\"timestamp\":%lld}",
+        temperatureC, humidityPct, pressureHpa, static_cast<long long>(nowEpoch));
+  } else {
+    payloadLength = snprintf(
+        payload, sizeof(payload),
+        "{\"gateway_id\":\"ESP32_GATEWAY_01\",\"source_id\":\"ESP32_SENSOR_01\","
+        "\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,"
+        "\"timestamp\":null}",
+        temperatureC, humidityPct, pressureHpa);
+  }
 
   if (payloadLength <= 0 || payloadLength >= static_cast<int>(sizeof(payload))) {
     Serial.println("Could not format MQTT payload.");
@@ -373,95 +310,6 @@ void publishLatestData() {
   } else {
     Serial.println("MQTT publish failed; latest sample will be retried.");
   }
-}
-
-void publishGasData() {
-  if (!gasReady || !mqttClient.connected()) {
-    return;
-  }
-
-  const GasData snapshot = latestGas;
-
-  char timestamp[24];
-  char rsText[16];
-  char ppmText[16];
-  formatTimestamp(timestamp, sizeof(timestamp));
-  formatFloatOrNull(rsText, sizeof(rsText), "%.2f", snapshot.rsKohm);
-  formatFloatOrNull(ppmText, sizeof(ppmText), "%.0f", snapshot.co2Ppm);
-
-  char payload[256];
-  const int payloadLength = snprintf(
-      payload, sizeof(payload),
-      "{\"gateway_id\":\"%s\",\"source_id\":\"%s\","
-      "\"sensor_mv\":%.0f,\"rs_kohm\":%s,\"co2_ppm_est\":%s,"
-      "\"timestamp\":%s}",
-      GATEWAY_ID, GAS_SOURCE_ID,
-      snapshot.sensorMv, rsText, ppmText, timestamp);
-
-  if (payloadLength <= 0 || payloadLength >= static_cast<int>(sizeof(payload))) {
-    Serial.println("Could not format MQ-135 MQTT payload.");
-    return;
-  }
-
-  if (mqttClient.publish(MQTT_TOPIC, payload)) {
-    Serial.printf("MQTT published to %s: %s\n", MQTT_TOPIC, payload);
-    gasReady = false;
-  } else {
-    Serial.println("MQTT publish (MQ-135) failed; latest sample will be retried.");
-  }
-}
-
-// -----------------------------------------------------------------------------
-// MQ-135 SAMPLING
-// -----------------------------------------------------------------------------
-
-void sampleGasSensor() {
-  const uint32_t now = millis();
-  if (now - lastGasSampleMs < GAS_SAMPLE_INTERVAL_MS) {
-    return;
-  }
-  lastGasSampleMs = now;
-
-  // The heater needs time to stabilise; readings before that are meaningless.
-  if (now < MQ135_WARMUP_MS) {
-    return;
-  }
-
-  // Average several calibrated readings to smooth out ADC and Wi-Fi noise.
-  uint32_t sumMv = 0;
-  for (uint8_t i = 0; i < GAS_ADC_SAMPLES; i++) {
-    sumMv += analogReadMilliVolts(MQ135_PIN);
-  }
-  const float pinMv = static_cast<float>(sumMv) / GAS_ADC_SAMPLES;
-  const float sensorMv = pinMv * MQ135_DIVIDER_RATIO;
-
-  float rsKohm = NAN;
-  float co2Ppm = NAN;
-
-  // The module's load resistor RL and the sensor Rs form a voltage divider:
-  //   Vout = Vcc * RL / (Rs + RL)  ->  Rs = RL * (Vcc - Vout) / Vout
-  if (sensorMv > 1.0f && sensorMv < MQ135_SUPPLY_MV) {
-    rsKohm = MQ135_RL_KOHM * (MQ135_SUPPLY_MV - sensorMv) / sensorMv;
-
-    // Calibration help: which R0 would make the current reading equal fresh air?
-    const float r0Candidate =
-        rsKohm * powf(FRESH_AIR_CO2_PPM / MQ135_CURVE_A, 1.0f / MQ135_CURVE_B);
-
-    if (MQ135_R0_KOHM > 0.0f) {
-      co2Ppm = MQ135_CURVE_A * powf(rsKohm / MQ135_R0_KOHM, -MQ135_CURVE_B);
-    }
-
-    Serial.printf("MQ-135: pin=%.0f mV, sensor=%.0f mV, Rs=%.2f kOhm, "
-                  "R0 candidate (if this is fresh air)=%.2f kOhm\n",
-                  pinMv, sensorMv, rsKohm, r0Candidate);
-  } else {
-    Serial.printf("MQ-135: reading out of range (pin=%.0f mV). Check wiring/divider.\n", pinMv);
-  }
-
-  latestGas.sensorMv = sensorMv;
-  latestGas.rsKohm = rsKohm;
-  latestGas.co2Ppm = co2Ppm;
-  gasReady = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -518,13 +366,6 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 Modbus-to-MQTT gateway starting...");
 
-  // MQ-135 analog input (ADC1). 11 dB attenuation gives roughly a 0-3.1 V range.
-  pinMode(MQ135_PIN, INPUT);
-  analogReadResolution(12);
-  analogSetPinAttenuation(MQ135_PIN, ADC_11db);
-  Serial.printf("MQ-135 on GPIO%u, warming up for %lu s before publishing.\n",
-                MQ135_PIN, static_cast<unsigned long>(MQ135_WARMUP_MS / 1000));
-
   startWifi();
 
 #if MQTT_USE_TLS
@@ -558,10 +399,7 @@ void loop() {
   }
 
   pollModbusServer();
-  sampleGasSensor();
-
   publishLatestData();
-  publishGasData();
 
   delay(5);
 }
